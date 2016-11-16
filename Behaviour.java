@@ -1,3 +1,4 @@
+import jdk.nashorn.internal.runtime.Debug;
 import model.*;
 
 import java.awt.*;
@@ -46,6 +47,7 @@ public class Behaviour
     // Персонаж
     private double preX, preY;
     private double preDangerLevel = -1, preLife = 0;
+    private double lifeFactor = 1.0;
     private boolean isEmpowered, isHastened, isShielded, isFrozen, isBurning;
 
     // Цели
@@ -68,6 +70,7 @@ public class Behaviour
         if (world.getTickIndex() - currentTick > 1)
         {
             waypoints = null;
+
             ticksToNextWave = WAVE_SPAWN_INTERVAL - (world.getTickIndex() - (world.getTickIndex() / WAVE_SPAWN_INTERVAL) * WAVE_SPAWN_INTERVAL);
             ticksToNextBonus = BONUS_SPAWN_INTERVAL - (world.getTickIndex() - (world.getTickIndex() / BONUS_SPAWN_INTERVAL) * BONUS_SPAWN_INTERVAL);
         }
@@ -85,6 +88,7 @@ public class Behaviour
 
         preX = wizard.getX();
         preY = wizard.getY();
+        preLife = wizard.getLife();
     }
 
     private void act()
@@ -92,118 +96,135 @@ public class Behaviour
         if (currentTick < 650)
             return;
 
+        lifeFactor = getLifeFactor(wizard);
         checkStatuses();
 
-        if (world.getMyPlayer().isStrategyCrashed())
-        {
-            move.setTurn(wizard.getAngle() + Math.toRadians(1));
-            return;
-        }
-
-        if (waypoints == null)
+        if (waypoints == null || currentTick == 750)
             chooseLane();
 
         currentZone = zoneManager.getZone(wizard);
 
+        if (ticksToNextWave < TICKS_UNTIL_STEPBACK)
+        {
+            for (final Point spawnPoint : minionSpawnPoints)
+            {
+                if (wizard.getDistanceTo(spawnPoint.getX(), spawnPoint.getY()) <= MINION_SPAWN_ZONE_RADIUS)
+                {
+                    final Point previousPoint = getPreviousWaypoint();
+                    if (nearestFriend != null && nearestFriend.getDistanceTo(wizard) < wizard.getCastRange() / 2.0 && nearestFriend.getDistanceTo(previousPoint.getX(), previousPoint.getY()) <= wizard.getDistanceTo(previousPoint.getX(), previousPoint.getY()))
+                        moveTo(previousPoint, game.getWizardForwardSpeed());
+                    else
+                    {
+                        strafeTo(previousPoint, 1.0);
+                        tryToAttack();
+                    }
+                    return;
+                }
+            }
+        }
+
         determinateTargets();
 
-        double angle = 0;
-        if (targetEnemy != null)
-        {
-            angle = wizard.getAngleTo(targetEnemy);
-            move.setTurn(angle);
-        }
+        DebugHelper.addLabel("targetEnemy", targetEnemy == null ? "null" : targetEnemy.getId());
+        DebugHelper.pathTo(wizard, targetEnemy, Color.BLACK);
+        DebugHelper.addLabel("nearestEnemy", nearestEnemy == null ? "null" : nearestEnemy.getId());
+        DebugHelper.pathTo(wizard, nearestEnemy, Color.RED);
 
-        int dangerLevel = calculateDangerLevel();
-        if (dangerLevel > -1 && dangerLevel < 5)
+        if (targetEnemy == null)
         {
-            double speed = (dangerLevel + 1) * 0.2;
-            strafeTo(getPreviousWaypoint(), speed);
+            moveTo(getNextWaypoint(), game.getWizardForwardSpeed());
         }
-        else if (dangerLevel == 5)
+        else
         {
-            moveTo(getPreviousWaypoint(), game.getWizardForwardSpeed());
-            return;
-        }
-        else if (dangerLevel == -1)
-        {
-            if (preX == wizard.getX() && preY == wizard.getY())
+            if (lifeFactor < 0.2)
             {
+                moveTo(getPreviousWaypoint(), game.getWizardForwardSpeed());
+                return;
+            }
+
+            if (wizard.getRemainingCooldownTicksByAction()[2] > game.getMagicMissileCooldownTicks() / 2 && targetEnemy != weakestEnemyWizard)
+                strafeTo(getPreviousWaypoint(), 1);
+            else if (nearestFriend != null)
+            {
+                double wizardDistanceToNearestEnemy = wizard.getDistanceTo(nearestEnemy);
+                List<LivingUnit> friendsInFrontOfMe = new ArrayList<>(nearestFriends.size());
                 for (final LivingUnit friend : nearestFriends)
                 {
-                    if (isUnitBuilding(friend))
-                    {
-                        double distance = wizard.getDistanceTo(friend);
-                        if (distance - 10 <= wizard.getRadius() + friend.getRadius())
-                        {
-                            final Point nextPoint = getNextWaypoint();
-                            double angleToNextPoint = wizard.getAngleTo(nextPoint.getX(), nextPoint.getY());
-                            double angleToBuilding = wizard.getAngleTo(friend.getX(), friend.getY());
-                            double sin = Math.sin(angleToBuilding - angleToNextPoint);
-                            int sign = sin > 0 ? -1 : 1;
-                            move.setStrafeSpeed(game.getWizardStrafeSpeed() * sign);
-                            return;
-                        }
-                    }
+                    if (friend.getDistanceTo(wizard) > wizard.getCastRange())
+                        continue;
+                    if (wizardDistanceToNearestEnemy > friend.getDistanceTo(nearestEnemy))
+                        friendsInFrontOfMe.add(friend);
                 }
-            }
+                int count = friendsInFrontOfMe.size();
 
-            // Если персонаж находится в безопасности, но всеравно получает урон, то видимо стоит отойти, т.к.
-            // у какого-то волшебника из противоположной фракции видимо на нас "встал"
-            if (preDangerLevel == -1 && preLife > wizard.getLife())
-            {
-                strafeTo(getPreviousWaypoint(), 0.2);
+                if (count == 0 || (count == 1 && getLifeFactor(friendsInFrontOfMe.get(0)) <= 0.5))
+                    strafeTo(getPreviousWaypoint(), 1);
+                else
+                    strafeTo(getNextWaypoint(), 1);
             }
-            else if (ticksToNextWave < TICKS_UNTIL_STEPBACK)
-            {
-                for (final Point spawnPoint : minionSpawnPoints)
-                {
-                    if (wizard.getDistanceTo(spawnPoint.getX(), spawnPoint.getY()) <= MINION_SPAWN_ZONE_RADIUS)
-                    {
-                        dangerLevel = 5;
-                        moveTo(getPreviousWaypoint(), game.getWizardForwardSpeed());
-                        break;
-                    }
-                }
-            }
+            else
+                strafeTo(getNextWaypoint(), 1);
         }
-        //DebugHelper.addLabel("ticksToNextWave", ticksToNextWave);
-        preDangerLevel = dangerLevel;
-        preLife = wizard.getLife();
 
-        //DebugHelper.addLabel("DangerLevel", dangerLevel);
+        tryToAttack();
+
+//        if (isDanger() || (wizard.getRemainingCooldownTicksByAction()[2] > game.getMagicMissileCooldownTicks() / 2 && targetEnemy != weakestEnemyWizard))
+//        {
+//            DebugHelper.addLabel("Intention", "Go back");
+//            if (lifeFactor < 0.2)
+//            {
+//                moveTo(getPreviousWaypoint(), game.getWizardForwardSpeed());
+//                return;
+//            }
+//            strafeTo(getPreviousWaypoint(), 1);
+//        }
+//        else
+//        {
+//            DebugHelper.addLabel("Intention", "Move forward");
+//            if (targetEnemy == null)
+//                moveTo(getNextWaypoint(), game.getWizardForwardSpeed());
+//            else
+//                strafeTo(getNextWaypoint(), 1.0);
+//        }
+    }
+
+    private void tryToAttack()
+    {
         if (targetEnemy != null)
         {
             double distance = wizard.getDistanceTo(targetEnemy);
-
             if (distance <= wizard.getCastRange())
             {
-                if (StrictMath.abs(angle) < game.getStaffSector() / 2.0D)
-                {
-                    if (distance <= game.getStaffRange())
-                        move.setAction(ActionType.STAFF);
-                    else
-                    {
-                        move.setAction(ActionType.MAGIC_MISSILE);
-                        move.setCastAngle(angle);
-                        move.setMinCastDistance(distance - targetEnemy.getRadius() + game.getMagicMissileRadius());
-                    }
-                }
-
-                if (wizard.getRemainingCooldownTicksByAction()[2] > game.getMagicMissileCooldownTicks() / 2 && nearestEnemyWizard != null && nearestEnemyWizard.getDistanceTo(wizard) <= nearestEnemyWizard.getCastRange())
-                {
-                    strafeTo(getPreviousWaypoint(), 1);
-                }
-
-                return;
+                shootTo(targetEnemy);
             }
-            if (dangerLevel == -1)
+            else if (weakestEnemy != null && targetEnemy != weakestEnemy)
             {
-                strafeTo(getNextWaypoint(), 1.0);
+                shootTo(weakestEnemy);
+            }
+            else if (nearestEnemy != null && targetEnemy != nearestEnemy)
+            {
+                shootTo(nearestEnemy);
             }
         }
-        else if (dangerLevel == -1)
-            moveTo(getNextWaypoint(), game.getWizardForwardSpeed());
+    }
+
+    private void shootTo(final LivingUnit unit)
+    {
+        double angle = wizard.getAngleTo(unit);
+        move.setTurn(angle);
+
+        if (StrictMath.abs(angle) < game.getStaffSector() / 2.0D)
+        {
+            double distance = wizard.getDistanceTo(unit);
+            if (distance <= game.getStaffRange())
+                move.setAction(ActionType.STAFF);
+            else
+            {
+                move.setAction(ActionType.MAGIC_MISSILE);
+                move.setCastAngle(angle);
+                move.setMinCastDistance(distance - unit.getRadius() + game.getMagicMissileRadius());
+            }
+        }
     }
 
     private void strafeTo(final Point point, double speedMultiplier)
@@ -227,64 +248,62 @@ public class Behaviour
 
     private void moveTo(final Point point, double speed)
     {
-        double angle = wizard.getAngleTo(point.getX(), point.getY());
-        move.setTurn(angle);
-
-        if (preX == wizard.getX() && preY == wizard.getY() && nearestFriend.getDistanceTo(wizard) <= wizard.getRadius() + nearestFriend.getRadius() + 5)
+        if (preX == wizard.getX() && preY == wizard.getY())
         {
-            double angleToObstacle = wizard.getAngleTo(nearestFriend.getX(), nearestFriend.getY());
-            double sin = Math.sin(angleToObstacle - angle);
-            move.setStrafeSpeed(game.getWizardStrafeSpeed() * sin > 0 ? -1 : 1);
-        }
-        else
-            move.setSpeed(speed);
-    }
-
-    private int calculateDangerLevel()
-    {
-        if (targetEnemy == null)
-            return -1;
-
-        if (nearestEnemy != null)
-        {
-            double wizardDistanceToNearestEnemy = wizard.getDistanceTo(nearestEnemy);
-            List<LivingUnit> friendsInFrontOfMe = new ArrayList<>(nearestFriends.size());
             for (final LivingUnit friend : nearestFriends)
             {
-                if (friend.getDistanceTo(wizard) > wizard.getCastRange())
-                    continue;
-                double distance = friend.getDistanceTo(nearestEnemy);
-                if (wizardDistanceToNearestEnemy > distance)
-                    friendsInFrontOfMe.add(friend);
-            }
-            int count = friendsInFrontOfMe.size();
-            if (count > 1 || (count == 1 && nearestFriends.size() >= nearestEnemies.size()))
-            {
-                return -1;
-            }
-            else if (count == 1 && getLifeFactor(friendsInFrontOfMe.get(0)) <= 0.5 && nearestEnemies.size() > 1)
-            {
-                return 1;
-            }
-            else
-            {
-                double hp = getLifeFactor(wizard);
-                if (hp <= 0.20)
-                    return 5;
-                else if (hp <= 0.5)
-                    return 4;
-                else if (hp < 0.65)
-                    return 3;
-                else if (hp < 0.75)
-                    return 2;
-                else if (hp < 0.85)
-                    return 1;
-                else
-                    return 0;
+                double distance = wizard.getDistanceTo(friend);
+                if (distance - 10 <= wizard.getRadius() + friend.getRadius())
+                {
+                    final Point nextPoint = getNextWaypoint();
+                    double angleToNextPoint = wizard.getAngleTo(nextPoint.getX(), nextPoint.getY());
+                    double angleToFriend = wizard.getAngleTo(friend.getX(), friend.getY());
+                    double sin = Math.sin(angleToFriend - angleToNextPoint);
+                    int sign = sin > 0 ? -1 : 1;
+                    move.setStrafeSpeed(game.getWizardStrafeSpeed() * sign);
+
+                    return;
+                }
             }
         }
-        return -1;
+
+        double angle = wizard.getAngleTo(point.getX(), point.getY());
+        move.setTurn(angle);
+        move.setSpeed(speed);
     }
+
+//    private boolean isDanger()
+//    {
+//        if (targetEnemy == null)
+//            return false;
+//
+//        if (nearestEnemy != null)
+//        {
+//
+//            if (nearestEnemyWizard != null && nearestEnemyWizard != targetEnemy && nearestEnemyWizard.getDistanceTo(wizard) <= wizard.getCastRange())
+//                return true;
+//
+//            double wizardDistanceToNearestEnemy = wizard.getDistanceTo(nearestEnemy);
+//            List<LivingUnit> friendsInFrontOfMe = new ArrayList<>(nearestFriends.size());
+//            for (final LivingUnit friend : nearestFriends)
+//            {
+//                if (friend.getDistanceTo(wizard) > wizard.getCastRange())
+//                    continue;
+//                double distance = friend.getDistanceTo(nearestEnemy);
+//                if (wizardDistanceToNearestEnemy > distance)
+//                    friendsInFrontOfMe.add(friend);
+//            }
+//            int count = friendsInFrontOfMe.size();
+//
+//            if (count == 0 && nearestEnemies.size() > 1)
+//                return true;
+//            if (count == 1 && targetEnemy == weakestEnemyWizard && targetEnemy.getLife() <= game.getMagicMissileDirectDamage())
+//                return false;
+//            if (count == 1 && getLifeFactor(friendsInFrontOfMe.get(0)) <= 0.5 && nearestEnemies.size() > 1)
+//                return true;
+//        }
+//        return false;
+//    }
 
     /*
     Можно оптимизировать для деревьев, разбив карту на зоны и добавить деревья в массив деревьев для каждой из зон
@@ -427,7 +446,7 @@ public class Behaviour
             double enemyHpFactor = getLifeFactor(weakestEnemyWizard);
             if (enemyHpFactor < 0.25 || enemyHpFactor < getLifeFactor(wizard))
             {
-                targetEnemy = nearestEnemyWizard;
+                targetEnemy = weakestEnemyWizard;
                 return;
             }
         }
@@ -438,7 +457,7 @@ public class Behaviour
             return;
         }
 
-        if (weakestEnemy != null && weakestEnemy != weakestEnemyWizard)
+        if (weakestEnemy != null && weakestEnemy != weakestEnemyWizard && wizard.getDistanceTo(weakestEnemy) <= wizard.getCastRange())
         {
             targetEnemy = weakestEnemy;
             return;
@@ -450,19 +469,19 @@ public class Behaviour
             return;
         }
 
-        if (nearestEnemy != null)
+        if (nearestEnemy != null && wizard.getDistanceTo(nearestEnemy) <= wizard.getCastRange())
         {
             targetEnemy = nearestEnemy;
             return;
         }
 
         // Не атаковать нейтральных минионов находясь в зоне рун.
-        if (nearestNeutral != null && currentZone != null && currentZone.getId() != ZONE_BONUS_ROAD)
-        {
-            if (getObstaclesOnWay(world.getTrees(), wizard, nearestNeutral.getX(), nearestNeutral.getY()) == 0)
-                targetEnemy = nearestNeutral;
-            return;
-        }
+//        if (nearestNeutral != null && currentZone != null && currentZone.getId() != ZONE_BONUS_ROAD && wizard.getDistanceTo(nearestNeutral) <= wizard.getCastRange())
+//        {
+//            if (getObstaclesOnWay(world.getTrees(), wizard, nearestNeutral.getX(), nearestNeutral.getY()) == 0)
+//                targetEnemy = nearestNeutral;
+//            return;
+//        }
     }
 
     private double distanceOnPath(CircularUnit unit, CircularUnit obstacle)
@@ -495,7 +514,7 @@ public class Behaviour
         double p0p1 = Math.pow(p1.getX() - p0x, 2) + Math.pow(p1.getY() - p0y, 2);
         double p2p1 = Math.pow(p1.getX() - c.getX(), 2) + Math.pow(p1.getY() - c.getY(), 2);
         double p0p2 = Math.pow(c.getX() - p0x, 2) + Math.pow(c.getY() - p0y, 2);
-        return Math.acos((p2p1 + p0p1  - p0p2) / Math.sqrt(4*p2p1*p0p1));
+        return Math.acos((p2p1 + p0p1 - p0p2) / Math.sqrt(4 * p2p1 * p0p1));
     }
 
     private void checkStatuses()
