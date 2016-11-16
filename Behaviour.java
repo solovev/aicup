@@ -144,6 +144,8 @@ public class Behaviour
 
             if (wizard.getRemainingCooldownTicksByAction()[2] > game.getMagicMissileCooldownTicks() / 2 && targetEnemy != weakestEnemyWizard)
                 strafeTo(getPreviousWaypoint(), 1);
+            else if (nearestEnemyWizard != null && targetEnemy != nearestEnemyWizard && nearestEnemyWizard.getDistanceTo(wizard) < nearestEnemyWizard.getCastRange())
+                strafeTo(getPreviousWaypoint(), 0.75);
             else if (nearestFriend != null)
             {
                 double wizardDistanceToNearestEnemy = wizard.getDistanceTo(nearestEnemy);
