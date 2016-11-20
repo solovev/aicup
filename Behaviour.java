@@ -37,18 +37,23 @@ public class Behaviour
 
     private final Map<LaneType, Point[]> waypointsByLane = new EnumMap<>(LaneType.class);
     private Point[] minionSpawnPoints;
+
+    private LaneType currentLane;
     private Point[] waypoints;
 
     private Random random;
 
     private double ticksToNextWave = WAVE_SPAWN_INTERVAL;
     private double ticksToNextBonus = BONUS_SPAWN_INTERVAL;
+    private int topBonusState = 1;
+    private int bottomBonusState = 1;
 
     // Персонаж
     private double preX, preY;
     private double preDangerLevel = -1, preLife = 0;
     private double lifeFactor = 1.0;
     private boolean isEmpowered, isHastened, isShielded, isFrozen, isBurning;
+    private Point interestingBonusLocation;
 
     // Цели
     private List<LivingUnit> nearestEnemies = new ArrayList<>(5);
@@ -59,6 +64,10 @@ public class Behaviour
     private LivingUnit nearestNeutral;
 
     private LivingUnit targetEnemy;
+    private boolean isTargetEmpowered, isTargetHastened, isTargetShielded, isTargetFrozen, isTargetBurning;
+
+    // Другое
+    private Point tempPoint;
 
     public void handleTick(final Wizard wizard, final World world, final Game game, final Move move)
     {
@@ -67,21 +76,29 @@ public class Behaviour
         this.game = game;
         this.move = move;
 
+        tempPoint = new Point(0, 0);
+
         if (world.getTickIndex() - currentTick > 1)
         {
             waypoints = null;
+            currentLane = null;
 
             ticksToNextWave = WAVE_SPAWN_INTERVAL - (world.getTickIndex() - (world.getTickIndex() / WAVE_SPAWN_INTERVAL) * WAVE_SPAWN_INTERVAL);
             ticksToNextBonus = BONUS_SPAWN_INTERVAL - (world.getTickIndex() - (world.getTickIndex() / BONUS_SPAWN_INTERVAL) * BONUS_SPAWN_INTERVAL);
         }
 
         currentTick = world.getTickIndex();
+
         ticksToNextWave--;
         ticksToNextBonus--;
         if (currentTick % WAVE_SPAWN_INTERVAL == 0)
             ticksToNextWave = WAVE_SPAWN_INTERVAL;
         if (currentTick % BONUS_SPAWN_INTERVAL == 0)
+        {
+            topBonusState = 0;
+            bottomBonusState = 0;
             ticksToNextBonus = BONUS_SPAWN_INTERVAL;
+        }
 
         init();
         act();
@@ -97,12 +114,25 @@ public class Behaviour
             return;
 
         lifeFactor = getLifeFactor(wizard);
+
         checkStatuses();
 
         if (waypoints == null || currentTick == 750)
             chooseLane();
 
         currentZone = zoneManager.getZone(wizard);
+
+        determinateTargets();
+        targetEnemy = getRelevantTarget();
+        checkTargetStatuses();
+
+        if (targetEnemy != null)
+            move.setTurn(wizard.getAngleTo(targetEnemy));
+
+        DebugHelper.addLabel("targetEnemy", targetEnemy == null ? "null" : targetEnemy.getId());
+        DebugHelper.pathTo(wizard, targetEnemy, Color.RED);
+        DebugHelper.addLabel("nearestEnemy", nearestEnemy == null ? "null" : nearestEnemy.getId());
+        DebugHelper.pathTo(wizard, nearestEnemy, Color.CYAN);
 
         if (ticksToNextWave < TICKS_UNTIL_STEPBACK)
         {
@@ -115,119 +145,329 @@ public class Behaviour
                         moveTo(previousPoint, game.getWizardForwardSpeed());
                     else
                     {
-                        strafeTo(previousPoint, 1.0);
-                        tryToAttack();
+                        moveBackTo(previousPoint, 1.0);
+                        attack();
                     }
                     return;
                 }
             }
         }
 
-        determinateTargets();
-
-        DebugHelper.addLabel("targetEnemy", targetEnemy == null ? "null" : targetEnemy.getId());
-        DebugHelper.pathTo(wizard, targetEnemy, Color.BLACK);
-        DebugHelper.addLabel("nearestEnemy", nearestEnemy == null ? "null" : nearestEnemy.getId());
-        DebugHelper.pathTo(wizard, nearestEnemy, Color.RED);
-
-        if (targetEnemy == null)
+        if (currentTick >= 2200 && currentZone != null && currentZone.getId() != ZONE_BASE && currentZone.getId() != ZONE_ENEMY_BASE)
         {
-            moveTo(getNextWaypoint(), game.getWizardForwardSpeed());
+            final Point laneCenter = getCurrentLaneCenter();
+            double distanceToCenter = wizard.getDistanceTo(laneCenter.getX(), laneCenter.getY());
+
+            final boolean cond1 = distanceToCenter <= 425 && nearestFriends.size() > nearestEnemies.size();
+            final boolean cond2 = distanceToCenter <= 425 && nearestEnemies.size() == 1 && isUnitBuilding(nearestEnemies.get(0));
+            final boolean cond3 = targetEnemy != null && zoneManager.getZone(targetEnemy) != currentZone && currentZone.getId() == ZONE_BONUS_ROAD;
+            final boolean cond4 = currentZone != null && currentZone.getId() == ZONE_BONUS_ROAD;
+            DebugHelper.addLabel("BONUS", "-");
+            if (cond3 || cond4 || cond1 || cond2)
+            {
+                DebugHelper.addLabel("COND", interestingBonusLocation + " " + "AAAAAAAAAAAAAAAAAAAAAAAAA");
+                checkBonusesState();
+                final Point bonusLocation = getBonusLocation();
+                DebugHelper.addLabel("BONUS", bonusLocation != null ? (bonusLocation.getX()) : "null");
+
+                if (bonusLocation != null)
+                    interestingBonusLocation = getReachablePoint(bonusLocation);
+                else
+                    interestingBonusLocation = null;
+
+                if (interestingBonusLocation != null && cond4)
+                {
+                    if (nearestEnemyWizard != null && zoneManager.getZone(nearestEnemyWizard) == currentZone)
+                    {
+                        final double distanceFromEnemy = nearestEnemyWizard.getDistanceTo(interestingBonusLocation.getX(), interestingBonusLocation.getY());
+                        final double distanceFromWizard = wizard.getDistanceTo(interestingBonusLocation.getX(), interestingBonusLocation.getY());
+
+                        if (distanceFromWizard < distanceFromEnemy)
+                            interestingBonusLocation = null;
+                    }
+                }
+            }
+            else
+            {
+                interestingBonusLocation = null;
+            }
+        }
+
+        if (interestingBonusLocation != null)
+        {
+            moveAndLookToEnemy(interestingBonusLocation);
+            attack();
+            DebugHelper.addLabel("COND", interestingBonusLocation + " " + "CCCCCCCCCCCCCCCCCCCCCCCCC");
+            return;
+        }
+
+        if (currentZone != null && currentZone.getId() == ZONE_BONUS_ROAD)
+        {
+            if (targetEnemy == null)
+            {
+                moveTo(getRelevantLanePoint(), game.getWizardForwardSpeed());
+            }
+            else
+            {
+                if (zoneManager.getZone(targetEnemy) == currentZone)
+                {
+                    if (targetEnemy == nearestEnemyWizard && nearestEnemies.size() == 1)
+                    {
+                        if (isTargetEmpowered || isTargetShielded || (lifeFactor < getLifeFactor(targetEnemy) && !isShielded && !isEmpowered))
+                        {
+                            strafeTo(getRelevantLanePoint(), game.getWizardForwardSpeed());
+                        }
+                        else
+                        {
+                            final double distanceToEnemy = wizard.getDistanceTo(targetEnemy);
+                            if (distanceToEnemy > game.getStaffRange())
+                                moveTo(targetEnemy, game.getWizardForwardSpeed());
+                        }
+
+                    }
+                    else
+                    {
+                        strafeTo(getRelevantLanePoint(), game.getWizardForwardSpeed());
+                    }
+                }
+                else
+                {
+                    strafeTo(getRelevantLanePoint(), game.getWizardForwardSpeed());
+                }
+            }
         }
         else
         {
-            if (lifeFactor < 0.2)
+            if (targetEnemy == null)
             {
-                moveTo(getPreviousWaypoint(), game.getWizardForwardSpeed());
-                return;
+                moveTo(getNextWaypoint(), game.getWizardForwardSpeed());
             }
-
-            if (wizard.getRemainingCooldownTicksByAction()[2] > game.getMagicMissileCooldownTicks() / 2 && targetEnemy != weakestEnemyWizard)
-                strafeTo(getPreviousWaypoint(), 1);
-            else if (nearestEnemyWizard != null && targetEnemy != nearestEnemyWizard && nearestEnemyWizard.getDistanceTo(wizard) < nearestEnemyWizard.getCastRange())
-                strafeTo(getPreviousWaypoint(), 0.75);
-            else if (nearestFriend != null)
+            else
             {
-                double wizardDistanceToNearestEnemy = wizard.getDistanceTo(nearestEnemy);
-                List<LivingUnit> friendsInFrontOfMe = new ArrayList<>(nearestFriends.size());
-                for (final LivingUnit friend : nearestFriends)
+                if (lifeFactor < 0.2)
                 {
-                    if (friend.getDistanceTo(wizard) > wizard.getCastRange())
-                        continue;
-                    if (wizardDistanceToNearestEnemy > friend.getDistanceTo(nearestEnemy))
-                        friendsInFrontOfMe.add(friend);
+                    moveTo(getPreviousWaypoint(), game.getWizardForwardSpeed());
+                    return;
                 }
-                int count = friendsInFrontOfMe.size();
 
-                if (count == 0 || (count == 1 && getLifeFactor(friendsInFrontOfMe.get(0)) <= 0.5))
-                    strafeTo(getPreviousWaypoint(), 1);
+                if (lifeFactor <= 0.75)
+                    moveBackTo(getPreviousWaypoint(), 1.0);
+
+                else if (nearestFriends.size() < nearestEnemies.size() && nearestEnemies.size() > 2 && wizard.getDistanceTo(targetEnemy) < wizard.getCastRange())
+                    moveBackTo(getPreviousWaypoint(), 1);
+                else if (nearestFriends.size() < nearestEnemies.size() && nearestEnemies.size() == 2 && wizard.getDistanceTo(targetEnemy) < wizard.getCastRange() * 0.75)
+                    moveBackTo(getPreviousWaypoint(), 1);
+                else if (nearestFriends.size() < nearestEnemies.size() && nearestEnemies.size() == 1 && wizard.getDistanceTo(targetEnemy) < wizard.getCastRange() * 0.6)
+                    moveBackTo(getPreviousWaypoint(), 1);
+                else if (targetEnemy == weakestEnemy && wizard.getDistanceTo(targetEnemy) < wizard.getCastRange() * 0.8)
+                    moveBackTo(getPreviousWaypoint(), 1);
+
+                else if (lifeFactor != 1.0 && nearestEnemyWizard != null && targetEnemy != nearestEnemyWizard && nearestEnemyWizard.getDistanceTo(wizard) <= nearestEnemyWizard.getCastRange())
+                    moveBackTo(getPreviousWaypoint(), 1);
+                else if (nearestFriend != null && nearestEnemy != null)
+                {
+                    double wizardDistanceToNearestEnemy = wizard.getDistanceTo(nearestEnemy);
+                    List<LivingUnit> friendsInFrontOfMe = new ArrayList<>(nearestFriends.size());
+                    for (final LivingUnit friend : nearestFriends)
+                    {
+                        if (friend.getDistanceTo(wizard) > wizard.getCastRange())
+                            continue;
+                        if (wizardDistanceToNearestEnemy > friend.getDistanceTo(nearestEnemy))
+                            friendsInFrontOfMe.add(friend);
+                    }
+                    int count = friendsInFrontOfMe.size();
+
+                    if (count == 1 && getLifeFactor(friendsInFrontOfMe.get(0)) <= 0.5)
+                    {
+                        if (targetEnemy == weakestEnemyWizard && getLifeFactor(targetEnemy) < 0.1)
+                            moveTo(targetEnemy, game.getWizardForwardSpeed());
+                        else
+                            moveBackTo(getPreviousWaypoint(), 1);
+                    }
+                    else if (count == 0)
+                    {
+                        if (nearestEnemies.size() > 1)
+                            moveBackTo(getPreviousWaypoint(), 1);
+                        else if (nearestEnemies.size() == 0)
+                            strafeTo(getNextWaypoint(), 0.5);
+                        else if (getLifeFactor(nearestEnemy) < lifeFactor)
+                            moveTo(nearestEnemy, game.getWizardForwardSpeed());
+                    }
+                    else if (wizardDistanceToNearestEnemy > wizard.getCastRange() / 2.0)
+                        strafeTo(getNextWaypoint(), 1);
+                }
                 else
                     strafeTo(getNextWaypoint(), 1);
             }
-            else
-                strafeTo(getNextWaypoint(), 1);
         }
-
-        tryToAttack();
-
-//        if (isDanger() || (wizard.getRemainingCooldownTicksByAction()[2] > game.getMagicMissileCooldownTicks() / 2 && targetEnemy != weakestEnemyWizard))
-//        {
-//            DebugHelper.addLabel("Intention", "Go back");
-//            if (lifeFactor < 0.2)
-//            {
-//                moveTo(getPreviousWaypoint(), game.getWizardForwardSpeed());
-//                return;
-//            }
-//            strafeTo(getPreviousWaypoint(), 1);
-//        }
-//        else
-//        {
-//            DebugHelper.addLabel("Intention", "Move forward");
-//            if (targetEnemy == null)
-//                moveTo(getNextWaypoint(), game.getWizardForwardSpeed());
-//            else
-//                strafeTo(getNextWaypoint(), 1.0);
-//        }
+        attack();
     }
 
-    private void tryToAttack()
+    private Point getRelevantLanePoint()
     {
-        if (targetEnemy != null)
+        final Point prePoint = getPreviousWaypoint();
+        final Point centerPoint = getCurrentLaneCenter();
+        Point destination = getReachablePoint(centerPoint, prePoint, getNextWaypoint());
+        if (destination == null)
         {
-            double distance = wizard.getDistanceTo(targetEnemy);
-            if (distance <= wizard.getCastRange())
-            {
-                shootTo(targetEnemy);
-            }
-            else if (weakestEnemy != null && targetEnemy != weakestEnemy)
-            {
-                shootTo(weakestEnemy);
-            }
-            else if (nearestEnemy != null && targetEnemy != nearestEnemy)
-            {
-                shootTo(nearestEnemy);
-            }
+            tempPoint.setX((centerPoint.getX() + prePoint.getX()) / 2);
+            tempPoint.setY((centerPoint.getY() + prePoint.getY()) / 2);
+            destination = tempPoint;
         }
+        return destination;
     }
 
-    private void shootTo(final LivingUnit unit)
+    private Point getReachablePoint(Point ...points)
     {
-        double angle = wizard.getAngleTo(unit);
-        move.setTurn(angle);
-
-        if (StrictMath.abs(angle) < game.getStaffSector() / 2.0D)
+        for (final Point point : points)
         {
-            double distance = wizard.getDistanceTo(unit);
-            if (distance <= game.getStaffRange())
-                move.setAction(ActionType.STAFF);
-            else
+            final List<CircularUnit> obstacles = new ArrayList<>(64);
+            for (final Tree tree : world.getTrees())
             {
-                move.setAction(ActionType.MAGIC_MISSILE);
-                move.setCastAngle(angle);
-                move.setMinCastDistance(distance - unit.getRadius() + game.getMagicMissileRadius());
+                if ((wizard.getX() < 2000 && (tree.getX() < 2000 || tree.getY() < 2000)) || (wizard.getX() > 2000 && (tree.getX() > 2000 || tree.getY() > 2000)))
+                    obstacles.add(tree);
             }
+            obstacles.addAll(nearestEnemies);
+            obstacles.addAll(nearestFriends);
+
+            int obstaclesOnWay = getObstaclesOnWay(obstacles, wizard, point.getX(), point.getY());
+
+            if (obstaclesOnWay == 0)
+                return point;
+        }
+        return null;
+    }
+
+    private Point getBonusLocation()
+    {
+        if (currentLane == LaneType.MIDDLE)
+        {
+            if (bottomBonusState != 2)
+                return zoneManager.getBottomBonusLocation();
+            if (topBonusState != 2)
+                return zoneManager.getTopBonusLocation();
+            else
+                return null;
+        }
+        else if (currentLane == LaneType.TOP && topBonusState != 2)
+            return zoneManager.getTopBonusLocation();
+        else if (currentLane == LaneType.BOTTOM && bottomBonusState != 2)
+            return zoneManager.getBottomBonusLocation();
+        else
+            return null;
+    }
+
+    private void checkBonusesState()
+    {
+        final Point topBonusLocation = zoneManager.getTopBonusLocation();
+        final Point bottomBonusLocation = zoneManager.getBottomBonusLocation();
+        if (wizard.getDistanceTo(topBonusLocation.getX(), topBonusLocation.getY()) <= wizard.getVisionRange())
+        {
+            for (final Bonus bonus : world.getBonuses())
+            {
+                if (wizard.getDistanceTo(bonus) <= wizard.getVisionRange())
+                {
+                    topBonusState = 1;
+                    return;
+                }
+            }
+            topBonusState = 2;
+        }
+        else if (wizard.getDistanceTo(bottomBonusLocation.getX(), bottomBonusLocation.getY()) <= wizard.getVisionRange())
+        {
+            for (final Bonus bonus : world.getBonuses())
+            {
+                if (wizard.getDistanceTo(bonus) <= wizard.getVisionRange())
+                {
+                    bottomBonusState = 1;
+                    return;
+                }
+            }
+            bottomBonusState = 2;
         }
     }
+
+    private Point getCurrentLaneCenter()
+    {
+        Point laneCenter = zoneManager.getMiddle().getCenter();
+        if (currentLane != null)
+        {
+            switch (currentLane)
+            {
+                case TOP:
+                    laneCenter = zoneManager.getTop().getCenter();
+                    break;
+                case BOTTOM:
+                    laneCenter = zoneManager.getBottom().getCenter();
+                    break;
+            }
+        }
+        return laneCenter;
+    }
+
+    private void moveAndLookToEnemy(final Point point)
+    {
+        if (nearestEnemy != null)
+            strafeTo(point, 1.0);
+        else
+            moveTo(point, game.getWizardForwardSpeed());
+    }
+
+    private void moveTo(final Point point, double speed)
+    {
+        moveTo(point.getX(), point.getY(), speed);
+    }
+
+    private void moveTo(final Unit unit, double speed)
+    {
+        moveTo(unit.getX(), unit.getY(), speed);
+    }
+
+    private void moveTo(double x, double y, double speed)
+    {
+        if (!circumventObstacle())
+        {
+            double angle = wizard.getAngleTo(x, y);
+            move.setTurn(angle);
+            move.setSpeed(speed);
+        }
+    }
+
+    private void moveBackTo(final Point point, double speedMultiplier)
+    {
+        double angle = wizard.getAngleTo(point.getX(), point.getY()) - 3.14159;
+        if (StrictMath.abs(angle) < game.getStaffSector())
+        {
+            if (!circumventObstacle())
+                move.setSpeed(-game.getWizardBackwardSpeed() * speedMultiplier);
+        }
+        else
+            strafeTo(point, speedMultiplier);
+    }
+
+    private boolean circumventObstacle()
+    {
+        if (preX == wizard.getX() && preY == wizard.getY())
+        {
+            for (final LivingUnit friend : nearestFriends)
+            {
+                double distance = wizard.getDistanceTo(friend);
+                if (distance - 10 <= wizard.getRadius() + friend.getRadius())
+                {
+                    final Point nextPoint = getNextWaypoint();
+                    double angleToNextPoint = wizard.getAngleTo(nextPoint.getX(), nextPoint.getY());
+                    double angleToFriend = wizard.getAngleTo(friend.getX(), friend.getY());
+                    double sin = Math.sin(angleToFriend - angleToNextPoint);
+                    int sign = sin > 0 ? -1 : 1;
+                    move.setStrafeSpeed(game.getWizardStrafeSpeed() * sign);
+
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
 
     private void strafeTo(final Point point, double speedMultiplier)
     {
@@ -248,113 +488,39 @@ public class Behaviour
         move.setSpeed(game.getWizardForwardSpeed() * Math.cos(angle) * speedMultiplier);
     }
 
-    private void moveTo(final Point point, double speed)
+    private void attack()
     {
-        if (preX == wizard.getX() && preY == wizard.getY())
+        final List<LivingUnit> targets = new ArrayList<>();
+        if (targetEnemy != null)
+            targets.add(targetEnemy);
+        if (weakestEnemy != null)
+            targets.add(weakestEnemy);
+        if (weakestEnemyWizard != null && weakestEnemyWizard != weakestEnemy)
+            targets.add(weakestEnemyWizard);
+        if (nearestEnemyWizard != null && nearestEnemyWizard != nearestEnemy)
+            targets.add(nearestEnemyWizard);
+        if (nearestEnemy != null)
+            targets.add(nearestEnemy);
+        if (nearestNeutral != null && currentZone != null && currentZone.getId() != ZONE_BONUS_ROAD)
+            targets.add(nearestNeutral);
+
+        for (final LivingUnit target : targets)
         {
-            for (final LivingUnit friend : nearestFriends)
+            double distance = wizard.getDistanceTo(target);
+            double angle = wizard.getAngleTo(target);
+            if (distance > wizard.getCastRange() || StrictMath.abs(angle) > game.getStaffSector() / 2.0D)
+                continue;
+
+            if (distance <= game.getStaffRange() + target.getRadius() && wizard.getRemainingCooldownTicksByAction()[2] != 0)
+                move.setAction(ActionType.STAFF);
+            else
             {
-                double distance = wizard.getDistanceTo(friend);
-                if (distance - 10 <= wizard.getRadius() + friend.getRadius())
-                {
-                    final Point nextPoint = getNextWaypoint();
-                    double angleToNextPoint = wizard.getAngleTo(nextPoint.getX(), nextPoint.getY());
-                    double angleToFriend = wizard.getAngleTo(friend.getX(), friend.getY());
-                    double sin = Math.sin(angleToFriend - angleToNextPoint);
-                    int sign = sin > 0 ? -1 : 1;
-                    move.setStrafeSpeed(game.getWizardStrafeSpeed() * sign);
-
-                    return;
-                }
+                move.setAction(ActionType.MAGIC_MISSILE);
+                move.setCastAngle(angle);
+                move.setMinCastDistance(distance - target.getRadius() + game.getMagicMissileRadius());
             }
+            break;
         }
-
-        double angle = wizard.getAngleTo(point.getX(), point.getY());
-        move.setTurn(angle);
-        move.setSpeed(speed);
-    }
-
-//    private boolean isDanger()
-//    {
-//        if (targetEnemy == null)
-//            return false;
-//
-//        if (nearestEnemy != null)
-//        {
-//
-//            if (nearestEnemyWizard != null && nearestEnemyWizard != targetEnemy && nearestEnemyWizard.getDistanceTo(wizard) <= wizard.getCastRange())
-//                return true;
-//
-//            double wizardDistanceToNearestEnemy = wizard.getDistanceTo(nearestEnemy);
-//            List<LivingUnit> friendsInFrontOfMe = new ArrayList<>(nearestFriends.size());
-//            for (final LivingUnit friend : nearestFriends)
-//            {
-//                if (friend.getDistanceTo(wizard) > wizard.getCastRange())
-//                    continue;
-//                double distance = friend.getDistanceTo(nearestEnemy);
-//                if (wizardDistanceToNearestEnemy > distance)
-//                    friendsInFrontOfMe.add(friend);
-//            }
-//            int count = friendsInFrontOfMe.size();
-//
-//            if (count == 0 && nearestEnemies.size() > 1)
-//                return true;
-//            if (count == 1 && targetEnemy == weakestEnemyWizard && targetEnemy.getLife() <= game.getMagicMissileDirectDamage())
-//                return false;
-//            if (count == 1 && getLifeFactor(friendsInFrontOfMe.get(0)) <= 0.5 && nearestEnemies.size() > 1)
-//                return true;
-//        }
-//        return false;
-//    }
-
-    /*
-    Можно оптимизировать для деревьев, разбив карту на зоны и добавить деревья в массив деревьев для каждой из зон
-     */
-    public List<LivingUnit> getObstaclesBetween(LivingUnit[] objects, final LivingUnit unitA, final LivingUnit unitB)
-    {
-        return getObstaclesBetween(objects, unitA, unitB.getX(), unitB.getY());
-    }
-
-    public List<LivingUnit> getObstaclesBetween(LivingUnit[] objects, final LivingUnit unitA, double px, double py)
-    {
-        final List<LivingUnit> obstacles = new ArrayList<>();
-        double distance = unitA.getDistanceTo(px, py);
-        for (LivingUnit obstacle : objects)
-        {
-            if (obstacle.getDistanceTo(px, py) < distance)
-            {
-                double x = px - unitA.getX();
-                double y = py - unitA.getY();
-                double area = Math.abs(x * (obstacle.getY() - unitA.getY()) - (obstacle.getX() - unitA.getX()) * y);
-                double lengthAB = Math.sqrt(x * x + y * y);
-                double h = area / lengthAB;
-
-                if (h < obstacle.getRadius())
-                    obstacles.add(obstacle);
-            }
-        }
-        return obstacles;
-    }
-
-    public List<LivingUnit> getObstaclesBetween(List<LivingUnit> objects, final LivingUnit unitA, double px, double py)
-    {
-        final List<LivingUnit> obstacles = new ArrayList<>();
-        double distance = unitA.getDistanceTo(px, py);
-        for (LivingUnit obstacle : objects)
-        {
-            if (obstacle.getDistanceTo(px, py) < distance)
-            {
-                double x = px - unitA.getX();
-                double y = py - unitA.getY();
-                double area = Math.abs(x * (obstacle.getY() - unitA.getY()) - (obstacle.getX() - unitA.getX()) * y);
-                double lengthAB = Math.sqrt(x * x + y * y);
-                double h = area / lengthAB;
-
-                if (h < obstacle.getRadius())
-                    obstacles.add(obstacle);
-            }
-        }
-        return obstacles;
     }
 
     private boolean isUnitALookingAtUnitB(final LivingUnit unitA, final LivingUnit unitB)
@@ -436,63 +602,76 @@ public class Behaviour
                 }
             }
         }
-        //DebugHelper.circle(wizard.getX(), wizard.getY(), wizard.getCastRange(), Color.CYAN);
-        if (nearestEnemy != null && nearestEnemy.getDistanceTo(wizard) <= wizard.getRadius() * 2.5)
+    }
+
+    private LivingUnit getRelevantTarget()
+    {
+        if (nearestEnemyWizard != null && currentZone != null && currentZone.getId() == ZONE_BONUS_ROAD && zoneManager.getZone(nearestEnemyWizard) == currentZone)
         {
-            targetEnemy = nearestEnemy;
-            return;
+            return nearestEnemyWizard;
         }
 
-        if (weakestEnemyWizard != null)
+        if (nearestEnemy != null && nearestEnemy.getDistanceTo(wizard) <= game.getStaffRange() + nearestEnemy.getRadius())
+        {
+            return nearestEnemy;
+        }
+
+        if (weakestEnemyWizard != null && weakestEnemyWizard.getLife() < weakestEnemyWizard.getMaxLife() * 0.2)
         {
             double enemyHpFactor = getLifeFactor(weakestEnemyWizard);
-            if (enemyHpFactor < 0.25 || enemyHpFactor < getLifeFactor(wizard))
+            if (enemyHpFactor < getLifeFactor(wizard))
             {
-                targetEnemy = weakestEnemyWizard;
-                return;
+                return weakestEnemyWizard;
             }
         }
 
         if (nearestEnemyWizard != null && (isEmpowered || isShielded) && wizard.getDistanceTo(nearestEnemyWizard) <= wizard.getCastRange())
         {
-            targetEnemy = nearestEnemyWizard;
-            return;
+            return nearestEnemyWizard;
         }
 
         if (weakestEnemy != null && weakestEnemy != weakestEnemyWizard && wizard.getDistanceTo(weakestEnemy) <= wizard.getCastRange())
         {
-            targetEnemy = weakestEnemy;
-            return;
+            return weakestEnemy;
         }
 
         if (nearestEnemyWizard != null && wizard.getDistanceTo(nearestEnemyWizard) <= wizard.getCastRange())
         {
-            targetEnemy = nearestEnemyWizard;
-            return;
+            return nearestEnemyWizard;
         }
 
         if (nearestEnemy != null && wizard.getDistanceTo(nearestEnemy) <= wizard.getCastRange())
         {
-            targetEnemy = nearestEnemy;
-            return;
+            return nearestEnemy;
         }
 
-        // Не атаковать нейтральных минионов находясь в зоне рун.
-//        if (nearestNeutral != null && currentZone != null && currentZone.getId() != ZONE_BONUS_ROAD && wizard.getDistanceTo(nearestNeutral) <= wizard.getCastRange())
-//        {
-//            if (getObstaclesOnWay(world.getTrees(), wizard, nearestNeutral.getX(), nearestNeutral.getY()) == 0)
-//                targetEnemy = nearestNeutral;
-//            return;
-//        }
+        if ((nearestNeutral != null && currentZone != null && currentZone.getId() != ZONE_BONUS_ROAD && wizard.getDistanceTo(nearestNeutral) <= game.getStaffRange() + nearestNeutral.getRadius() && StrictMath.abs(nearestNeutral.getAngleTo(wizard)) <= game.getStaffSector() / 2.0D) || (nearestNeutral != null && zoneManager.getZone(nearestNeutral).getId() == ZONE_BONUS_ROAD && currentZone.getId() == ZONE_BONUS_ROAD))
+        {
+            return nearestNeutral;
+        }
+
+        // Нападаем на нейтрала, только в случае, если он сам напал на нас или на одного из союзных юнитов совсем поблизости
+        //        if (currentZone != null && currentZone.getId() != ZONE_BONUS_ROAD && nearestNeutral != null && nearestNeutral.getDistanceTo(wizard) <= wizard.getCastRange())
+        //        {
+        //            if (nearestNeutral.getDistanceTo(wizard) <= wizard.getRadius() + nearestNeutral.getRadius() + 5 && isUnitALookingAtUnitB(nearestNeutral, wizard))
+        //            {
+        //                return nearestNeutral;
+        //            }
+        //            else
+        //            {
+        //                for (final LivingUnit friend : nearestFriends)
+        //                {
+        //                    if (nearestNeutral.getDistanceTo(friend) <= friend.getRadius() + nearestNeutral.getRadius() + 5 && isUnitALookingAtUnitB(nearestNeutral, friend))
+        //                    {
+        //                        return nearestNeutral;
+        //                    }
+        //                }
+        //            }
+        //        }
+        return null;
     }
 
-    private double distanceOnPath(CircularUnit unit, CircularUnit obstacle)
-    {
-        double angleToObstacle = Math.sin(unit.getAngleTo(obstacle));
-        return angleToObstacle * unit.getDistanceTo(obstacle);
-    }
-
-    public int getObstaclesOnWay(final CircularUnit[] obstacles, final CircularUnit unit, double x, double y)
+    private int getObstaclesOnWay(final List<CircularUnit> obstacles, final CircularUnit unit, double x, double y)
     {
         int obstaclesCount = 0;
         double dUtoP = unit.getDistanceTo(x, y);
@@ -545,44 +724,43 @@ public class Behaviour
         }
     }
 
+    private void checkTargetStatuses()
+    {
+        if (targetEnemy == null)
+            return;
+
+        isTargetEmpowered = isTargetHastened = isTargetShielded = isTargetFrozen = isTargetBurning = false;
+        for (final Status status : targetEnemy.getStatuses())
+        {
+            switch (status.getType())
+            {
+                case EMPOWERED:
+                    isTargetEmpowered = true;
+                    break;
+                case HASTENED:
+                    isTargetHastened = true;
+                    break;
+                case SHIELDED:
+                    isTargetShielded = true;
+                    break;
+                case FROZEN:
+                    isTargetFrozen = true;
+                    break;
+                case BURNING:
+                    isTargetBurning = true;
+                    break;
+            }
+        }
+    }
+
     private void chooseLane()
     {
-        LaneType targetLane;
-        // Если это наш первый выбор линии, то выбираем наиболее свободную, предпочтительней - мид.
-        if (currentTick <= 750)
-            targetLane = getMostFreeLane();
-        else
-        {
-            // Выбираем линию, где противники максимально ближе к нашей базе
-            targetLane = getMostRiskyLane();
-            // Если на всех линиях наша команда справляется хорошо, выбираем ту, где меньше союзных героев
-            if (targetLane == null)
-                targetLane = getMostFreeLane();
-        }
-        //DebugHelper.addLabel("Lane", targetLane);
-        waypoints = waypointsByLane.get(targetLane);
+        currentLane = getMostFreeLane();
+        waypoints = waypointsByLane.get(currentLane);
     }
 
     private LaneType getMostRiskyLane()
     {
-        final Zone top = zoneManager.getTop();
-        final Zone bot = zoneManager.getBottom();
-        final Zone mid = zoneManager.getMiddle();
-        for (final Minion m : world.getMinions())
-        {
-            if (m.getFaction() == wizard.getFaction())
-                continue;
-
-            for (int i = top.getRadarsCount() - 1; i <= 0; i--)
-            {
-                if (mid.getRadar(i).isInRange(m))
-                    return LaneType.MIDDLE;
-                else if (top.getRadar(i).isInRange(m))
-                    return LaneType.TOP;
-                else if (bot.getRadar(i).isInRange(m))
-                    return LaneType.BOTTOM;
-            }
-        }
         return null;
     }
 
@@ -610,10 +788,12 @@ public class Behaviour
         }
 
         int min = Math.min(onMiddle, Math.min(onTop, onBottom));
-        if (onMiddle == 1 || onMiddle == min)
+        if (min == onTop)
+            return LaneType.TOP;
+        else if (min == onBottom)
+            return LaneType.BOTTOM;
+        else
             return LaneType.MIDDLE;
-
-        return onTop == min ? LaneType.TOP : LaneType.BOTTOM;
     }
 
     private Point getNextWaypoint()
@@ -726,6 +906,16 @@ public class Behaviour
             return y;
         }
 
+        public void setX(double x)
+        {
+            this.x = x;
+        }
+
+        public void setY(double y)
+        {
+            this.y = y;
+        }
+
         public double getDistanceTo(double x, double y)
         {
             return StrictMath.hypot(this.x - x, this.y - y);
@@ -749,6 +939,11 @@ public class Behaviour
     private static final int ZONE_BONUS_ROAD = 4;
     private static final int ZONE_ENEMY_BASE = 5;
 
+    private static final int ZONE_WESTERN_FOREST = 6;
+    private static final int ZONE_NORTHERN_FOREST = 7;
+    private static final int ZONE_EASTERN_FOREST = 8;
+    private static final int ZONE_SOUTHERN_FOREST = 9;
+
     private class ZoneManager
     {
         private final Point[] middleVertices = {new Point(400, 3200), new Point(800, 3600), new Point(3600, 800), new Point(3200, 400)};
@@ -758,31 +953,33 @@ public class Behaviour
         private final Point[] baseVertices = {new Point(0, 3200), new Point(400, 3200), new Point(800, 3600), new Point(800, 4000), new Point(0, 4000)};
         private final Point[] enemyBaseVertices = {new Point(3200, 0), new Point(4000, 0), new Point(4000, 800), new Point(3600, 800), new Point(3200, 400)};
 
-        private final Radar[] middleRadars = {new Radar(1200, 2800, 600), new Radar(800, 3200, 500)};
-        private final Radar[] topRadars = {new Radar(200, 1600, 600), new Radar(200, 2800, 400)};
-        private final Radar[] bottomRadars = {new Radar(2400, 3800, 600), new Radar(1200, 3800, 500)};
+        private final Point[] westernForestVertices = {new Point(400, 3200), new Point(400, 800), new Point(1600, 2000)};
+        private final Point[] northernForestVertices = {new Point(2000, 1600), new Point(3200, 400), new Point(800, 400)};
+        private final Point[] easternForestVertices = {new Point(2400, 2000), new Point(3600, 800), new Point(3600, 3200)};
+        private final Point[] southernForestVertices = {new Point(2000, 2400), new Point(3200, 3600), new Point(800, 3600)};
 
         private Zone[] zones;
+        private final Point topBonus = new Point(1200, 1200);
+        private final Point bottomBonus = new Point(2800, 2800);
 
         public ZoneManager()
         {
-            zones = new Zone[6];
-            zones[0] = new Zone(ZONE_BASE, null, baseVertices);
-            zones[1] = new Zone(ZONE_TOP, topRadars, topVertices);
-            zones[2] = new Zone(ZONE_BOTTOM, bottomRadars, bottomVertices);
-            zones[3] = new Zone(ZONE_MIDDLE, middleRadars, middleVertices);
-            zones[4] = new Zone(ZONE_BONUS_ROAD, null, bonusRoadVertices);
-            zones[5] = new Zone(ZONE_ENEMY_BASE, null, enemyBaseVertices);
+            zones = new Zone[10];
+            zones[0] = new Zone(ZONE_BASE, new Point(400, 3600), baseVertices);
+            zones[1] = new Zone(ZONE_TOP, new Point(400, 400), topVertices);
+            zones[2] = new Zone(ZONE_BOTTOM, new Point(3600, 3600), bottomVertices);
+            zones[3] = new Zone(ZONE_MIDDLE, new Point(2000, 2000), middleVertices);
+            zones[4] = new Zone(ZONE_BONUS_ROAD, new Point(2000, 2000), bonusRoadVertices);
+            zones[5] = new Zone(ZONE_ENEMY_BASE, new Point(3600, 400), enemyBaseVertices);
+            zones[6] = new Zone(ZONE_WESTERN_FOREST, new Point(1000, 2000), westernForestVertices);
+            zones[7] = new Zone(ZONE_NORTHERN_FOREST, new Point(2000, 1000), northernForestVertices);
+            zones[8] = new Zone(ZONE_EASTERN_FOREST, new Point(3000, 2000), easternForestVertices);
+            zones[9] = new Zone(ZONE_SOUTHERN_FOREST, new Point(2000, 3000), southernForestVertices);
         }
 
-        public Zone getZone(final CircularUnit unit)
+        public Zone getZone(int id)
         {
-            for (final Zone zone : zones)
-            {
-                if (zone.containsUnit(unit))
-                    return zone;
-            }
-            return null;
+            return zones[id];
         }
 
         public Zone getTop()
@@ -799,18 +996,43 @@ public class Behaviour
         {
             return zones[3];
         }
+
+        public Zone getBonusRoad()
+        {
+            return zones[4];
+        }
+
+        public Zone getZone(final CircularUnit unit)
+        {
+            for (final Zone zone : zones)
+            {
+                if (zone.containsUnit(unit))
+                    return zone;
+            }
+            return null;
+        }
+
+        public Point getTopBonusLocation()
+        {
+            return topBonus;
+        }
+
+        public Point getBottomBonusLocation()
+        {
+            return bottomBonus;
+        }
     }
 
     private class Zone
     {
         private final int id;
-        private final Radar[] radars;
+        private final Point center;
         private final Point[] vertices;
 
-        public Zone(int id, Radar[] radars, Point[] vertices)
+        public Zone(int id, Point center, Point[] vertices)
         {
             this.id = id;
-            this.radars = radars;
+            this.center = center;
             this.vertices = vertices;
         }
 
@@ -835,51 +1057,14 @@ public class Behaviour
             return id;
         }
 
-        public int getRadarsCount()
+        public Point getCenter()
         {
-            return radars.length;
+            return center;
         }
 
-        public Radar getRadar(int index)
+        public boolean isForest()
         {
-            return radars[index];
-        }
-
-        public Point[] getVertices()
-        {
-            return vertices;
-        }
-    }
-
-    private class Radar
-    {
-        private final double x, y, radius;
-
-        public Radar(double x, double y, double radius)
-        {
-            this.x = x;
-            this.y = y;
-            this.radius = radius;
-        }
-
-        public double getX()
-        {
-            return x;
-        }
-
-        public double getY()
-        {
-            return y;
-        }
-
-        public double getRadius()
-        {
-            return radius;
-        }
-
-        public boolean isInRange(final Unit unit)
-        {
-            return unit.getDistanceTo(x, y) <= radius;
+            return false;
         }
     }
 }
